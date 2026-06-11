@@ -1,11 +1,17 @@
 import io
 import os
+from pathlib import Path
 from html import escape
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    import kagglehub
+except ImportError:
+    kagglehub = None
 
 # =============================================================
 # INDIA WATER QUALITY ACTION MONITOR
@@ -562,7 +568,8 @@ inject_css()
 # -------------------------------------------------------------
 # Data pipeline
 # -------------------------------------------------------------
-DEFAULT_DATA_PATH = "IndiaAffectedWaterQualityAreas.csv"
+KAGGLE_DATASET_HANDLE = "venkatramakrishnan/india-water-quality-data"
+PREFERRED_CSV_NAME = "IndiaAffectedWaterQualityAreas.csv"
 REQUIRED_COLUMNS = [
     "State Name",
     "District Name",
@@ -572,15 +579,68 @@ REQUIRED_COLUMNS = [
 ]
 
 
-@st.cache_data(show_spinner="Menyiapkan data dashboard...")
-def load_and_aggregate_data(file_bytes=None, path=DEFAULT_DATA_PATH):
-    """Load raw data, clean key fields, and aggregate to State-District-Year-Parameter."""
+def find_dataset_csv(dataset_dir: str | Path) -> Path:
+    """Find the most relevant CSV inside the KaggleHub download directory."""
+    dataset_dir = Path(dataset_dir)
+    csv_files = sorted(dataset_dir.rglob("*.csv"))
+
+    if not csv_files:
+        raise FileNotFoundError("Tidak ada file CSV di folder hasil download Kaggle.")
+
+    # Prefer the known filename from the selected Kaggle dataset.
+    for csv_file in csv_files:
+        if csv_file.name == PREFERRED_CSV_NAME:
+            return csv_file
+
+    # Fallback: scan CSV headers and pick the first file containing the required columns.
+    for csv_file in csv_files:
+        try:
+            columns = pd.read_csv(csv_file, encoding="cp1252", nrows=0).columns.tolist()
+            if all(col in columns for col in REQUIRED_COLUMNS):
+                return csv_file
+        except Exception:
+            continue
+
+    available = ", ".join(file.name for file in csv_files[:8])
+    raise FileNotFoundError(
+        "CSV ditemukan, tetapi tidak ada yang memiliki kolom wajib. "
+        f"File yang terdeteksi: {available}"
+    )
+
+
+@st.cache_data(show_spinner="Mengunduh dataset dari KaggleHub dan menyiapkan data dashboard...")
+def load_and_aggregate_data(file_bytes=None, uploaded_filename=None):
+    """Load data from KaggleHub by default, clean fields, and aggregate to State-District-Year-Parameter.
+
+    Priority:
+    1. Uploaded CSV from sidebar, when provided.
+    2. KaggleHub dataset: venkatramakrishnan/india-water-quality-data.
+    """
+    source_label = "KaggleHub"
+    source_detail = KAGGLE_DATASET_HANDLE
+
     if file_bytes is not None:
         df = pd.read_csv(io.BytesIO(file_bytes), encoding="cp1252")
+        source_label = "Uploaded CSV"
+        source_detail = uploaded_filename or "manual_upload.csv"
     else:
-        if not os.path.exists(path):
-            return None, [f"File `{path}` tidak ditemukan di direktori aktif."]
-        df = pd.read_csv(path, encoding="cp1252")
+        if kagglehub is None:
+            return None, [
+                "Package `kagglehub` belum terpasang. Tambahkan `kagglehub` ke requirements.txt, "
+                "lalu jalankan ulang aplikasi."
+            ]
+
+        try:
+            dataset_path = kagglehub.dataset_download(KAGGLE_DATASET_HANDLE)
+            csv_path = find_dataset_csv(dataset_path)
+            df = pd.read_csv(csv_path, encoding="cp1252")
+            source_detail = str(csv_path)
+        except Exception as exc:
+            return None, [
+                "Dataset Kaggle belum dapat dimuat.",
+                f"Detail error: {exc}",
+                "Pastikan koneksi internet tersedia dan, bila diperlukan, konfigurasi KAGGLE_USERNAME serta KAGGLE_KEY sudah benar."
+            ]
 
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
@@ -621,6 +681,9 @@ def load_and_aggregate_data(file_bytes=None, path=DEFAULT_DATA_PATH):
     agg_df["state_title"] = agg_df["state"].str.title().replace({"Orissa": "Odisha"})
 
     metadata = {
+        "source_label": source_label,
+        "source_detail": source_detail,
+        "dataset_handle": KAGGLE_DATASET_HANDLE,
         "raw_rows": len(df) + invalid_years,
         "clean_rows": len(df),
         "invalid_years": invalid_years,
@@ -748,17 +811,26 @@ st.sidebar.markdown(
 )
 
 uploaded_file = st.sidebar.file_uploader(
-    "Gunakan CSV lain bila diperlukan",
+    "Gunakan CSV manual bila diperlukan",
     type=["csv"],
-    help="Opsional. Jika kosong, aplikasi memakai IndiaAffectedWaterQualityAreas.csv di folder yang sama.",
+    help=(
+        "Opsional. Jika kosong, aplikasi otomatis mengunduh dataset terbaru dari "
+        "KaggleHub: venkatramakrishnan/india-water-quality-data."
+    ),
 )
 
 file_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
-agg_data, load_status = load_and_aggregate_data(file_bytes=file_bytes)
+agg_data, load_status = load_and_aggregate_data(
+    file_bytes=file_bytes,
+    uploaded_filename=uploaded_file.name if uploaded_file is not None else None,
+)
 
 if agg_data is None:
     st.error("Data belum dapat dimuat. " + " ".join(load_status))
     st.stop()
+
+st.sidebar.success(f"Sumber data aktif: {load_status['source_label']}")
+st.sidebar.caption(f"Detail sumber: {load_status['source_detail']}")
 
 available_states = sorted(agg_data["state"].dropna().unique().tolist())
 available_years = sorted(agg_data["year"].dropna().unique().tolist())
@@ -849,6 +921,7 @@ st.markdown(
                 <div class="hero-meta">🧭 State → District</div>
                 <div class="hero-meta">🧪 Iron · Salinity · Fluoride · Arsenic · Nitrate</div>
                 <div class="hero-meta">📅 Multi-year comparison</div>
+                <div class="hero-meta">🔗 KaggleHub latest dataset</div>
             </div>
         </div>
     </div>
@@ -1182,6 +1255,7 @@ with detail_tab:
         f"""
         <div class="data-note">
             <strong>Catatan interpretasi:</strong> angka <em>habitations</em> adalah jumlah nama habitation unik dalam kombinasi State-District-Tahun-Parameter. Angka ini adalah catatan lokasi/wilayah terdampak, bukan kadar kimia air atau tingkat bahaya langsung.<br><br>
+            Sumber data aktif: <strong>{escape(str(load_status['source_label']))}</strong> · Dataset: <strong>{escape(str(load_status['dataset_handle']))}</strong><br>
             Baris mentah terbaca: <strong>{fmt_int(load_status['raw_rows'])}</strong> · Baris valid setelah pembersihan tahun: <strong>{fmt_int(load_status['clean_rows'])}</strong> · Tahun tidak valid: <strong>{fmt_int(load_status['invalid_years'])}</strong> · Baris agregat aktif: <strong>{fmt_int(len(display_table_df))}</strong>
         </div>
         """,
